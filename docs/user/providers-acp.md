@@ -35,6 +35,37 @@ version published by the Registry. Their commands are available in a new server 
 sign-in and direct use. Removing an agent's last provider instance removes T3-managed binary files
 but keeps package installs. To use an existing local binary, set **Executable override** explicitly.
 
+## Use an existing local agent
+
+Create `acp-agents.json` in your T3 home on the server. Back up an existing file before editing it. Local entries appear in the same **Settings → Providers → Add provider** search as public Registry agents, and take precedence when IDs match. Registry refreshes never overwrite this file.
+
+For example, to use an existing Hermes installation, replace the paths below with its executable and existing profile directory:
+
+```json
+{
+  "agents": [
+    {
+      "id": "hermes-local",
+      "name": "Hermes Agent",
+      "version": "0.21.5",
+      "description": "Existing Hermes installation",
+      "command": {
+        "path": "/home/you/.local/bin/hermes",
+        "args": ["acp"],
+        "env": { "HERMES_HOME": "/home/you/.hermes" },
+        "cwd": "/home/you/.hermes"
+      }
+    }
+  ]
+}
+```
+
+T3 runs the command directly, without a shell or package installation. Arguments and environment values are literal strings. Relative executable paths are resolved from the backend's working directory before changing to the agent's `cwd`. The command inherits the provider instance's environment, then applies `command.env`. Omit `cwd` to start the process in the thread's workspace. ACP sessions still receive the thread's workspace even when the process starts elsewhere. Keep stdout reserved for ACP JSON-RPC and send launcher diagnostics to stderr.
+
+Use the existing Hermes home to retain its authentication, configuration, memory, skills, and state. Check `hermes acp --check` before adding it. The entry's version is descriptive metadata and does not install or pin a version. T3 discovers models and capabilities from the running agent.
+
+To undo setup, remove the provider instance in Settings and remove its entry from `acp-agents.json`, or restore your backup. T3 does not remove the local executable or the agent's own data.
+
 ## Signing in
 
 Open the agent's account section in **Settings → Providers** on web or desktop. Choose

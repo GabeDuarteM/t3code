@@ -43,10 +43,10 @@ export function resolveOfficialAcpRegistryIconUrl(icon: string | null | undefine
   }
 }
 
-export const AcpRegistryDistribution = Schema.Literals(["binary", "npx", "uvx"]);
+export const AcpRegistryDistribution = Schema.Literals(["binary", "npx", "uvx", "local"]);
 export type AcpRegistryDistribution = typeof AcpRegistryDistribution.Type;
 
-export const AcpRegistryIntegrity = Schema.Literals(["sha256", "registry"]);
+export const AcpRegistryIntegrity = Schema.Literals(["sha256", "registry", "local"]);
 export type AcpRegistryIntegrity = typeof AcpRegistryIntegrity.Type;
 
 export const AcpRegistrySearchInput = Schema.Struct({

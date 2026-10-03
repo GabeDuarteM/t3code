@@ -879,7 +879,8 @@ export const AcpRegistrySettings = makeProviderSettingsSchema(
       Schema.withDecodingDefault(Effect.succeed("")),
       Schema.annotateKey({
         title: "Registry agent ID",
-        description: "Agent identifier from the official ACP Registry, for example 'devin'.",
+        description:
+          "Agent identifier from the ACP Registry or this environment's local ACP agents.",
         providerSettingsForm: { placeholder: "devin", clearWhenEmpty: "persist" },
       }),
     ),

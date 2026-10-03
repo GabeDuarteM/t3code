@@ -1582,3 +1582,279 @@ describe("acpRegistryManagedBinaryDirectories", () => {
     }).pipe(Effect.provide(NodeServices.layer), Effect.scoped),
   );
 });
+
+describe("local ACP entries", () => {
+  const localAgent = {
+    id: "hermes-local",
+    name: "Hermes Agent",
+    version: "0.21.5",
+    description: "Existing local installation",
+    command: {
+      path: process.execPath,
+      args: ["--version"],
+      env: { HERMES_HOME: "/profiles/existing" },
+      cwd: "/profiles/existing",
+    },
+  };
+
+  it.effect(
+    "launches local entries offline and preserves them across registry refresh and restart",
+    () => {
+      const publicAgent = {
+        ...makeAgent({ npx: { package: "@example/acp@1.2.3" } }),
+        id: localAgent.id,
+        name: "Public Hermes",
+      };
+      return Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const root = yield* fs.makeTempDirectoryScoped({ prefix: "t3-local-acp-" });
+        const localAgentsPath = `${root}/acp-agents.json`;
+        const contents = encodeUnknownJson({ agents: [localAgent] });
+        yield* fs.writeFileString(localAgentsPath, contents);
+        const options = { cacheDir: root, toolsDir: `${root}/tools`, localAgentsPath, registryUrl };
+        const catalog = yield* AcpRegistrySupport.makeAcpRegistryCatalog(options);
+        const localSettings = settings({ agentId: "hermes-local" });
+        expect(yield* catalog.inspect(localSettings)).toMatchObject({
+          status: "ready",
+          distribution: "local",
+        });
+        expect(yield* catalog.prepare({ agentId: "hermes-local" })).toEqual({
+          agentId: "hermes-local",
+          version: "0.21.5",
+          distribution: "local",
+          prepared: true,
+        });
+        const resolved = yield* catalog.resolve(localSettings, "/workspace", {
+          INHERITED_AUTH: "retained",
+        });
+        expect(resolved.spawn).toEqual({
+          command: process.execPath,
+          args: ["--version"],
+          cwd: "/profiles/existing",
+          env: { INHERITED_AUTH: "retained", HERMES_HOME: "/profiles/existing" },
+        });
+        const searched = yield* catalog.search({ query: "Hermes" });
+        expect(searched.agents).toEqual([
+          {
+            id: "hermes-local",
+            name: "Hermes Agent",
+            version: "0.21.5",
+            description: "Existing local installation",
+            authors: [],
+            license: null,
+            website: null,
+            repository: null,
+            icon: null,
+            distribution: "local",
+            integrity: "local",
+          },
+        ]);
+        const offline = yield* AcpRegistrySupport.makeAcpRegistryCatalog({
+          ...options,
+          cacheDir: `${root}/offline`,
+        }).pipe(
+          Effect.provideService(
+            HttpClient.HttpClient,
+            HttpClient.make((request) =>
+              Effect.succeed(
+                HttpClientResponse.fromWeb(request, new Response("unavailable", { status: 503 })),
+              ),
+            ),
+          ),
+        );
+        expect(yield* offline.search({ query: "Hermes" })).toEqual(searched);
+        expect(yield* fs.readFileString(localAgentsPath)).toBe(contents);
+        expect(
+          yield* fs
+            .readFileString(`${root}/acp-registry/registry.json`)
+            .pipe(
+              Effect.flatMap(Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Unknown))),
+            ),
+        ).toEqual({
+          version: "1.0.0",
+          agents: [publicAgent],
+        });
+        const restarted = yield* AcpRegistrySupport.makeAcpRegistryCatalog(options);
+        expect(
+          (yield* restarted.resolve(localSettings, "/workspace", { INHERITED_AUTH: "retained" }))
+            .spawn,
+        ).toEqual(resolved.spawn);
+        yield* fs.writeFileString(
+          localAgentsPath,
+          encodeUnknownJson({
+            agents: [
+              {
+                ...localAgent,
+                command: { ...localAgent.command, cwd: undefined, args: ["--help"] },
+              },
+            ],
+          }),
+        );
+        expect((yield* restarted.resolve(localSettings, "/workspace", {})).spawn).toEqual({
+          command: process.execPath,
+          args: ["--help"],
+          cwd: "/workspace",
+          env: { HERMES_HOME: "/profiles/existing" },
+        });
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(
+          resolverLayer((request) =>
+            Effect.succeed(
+              HttpClientResponse.fromWeb(request, new Response(makeRegistry(publicAgent))),
+            ),
+          ),
+        ),
+      );
+    },
+  );
+
+  it.effect("keeps local command descriptors out of the public registry", () => {
+    return Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "t3-local-acp-trust-" });
+      const localAgentsPath = `${root}/acp-agents.json`;
+      const catalog = yield* AcpRegistrySupport.makeAcpRegistryCatalog({
+        cacheDir: root,
+        toolsDir: `${root}/tools`,
+        localAgentsPath,
+        registryUrl,
+      });
+      expect(yield* catalog.search({ query: "Hermes" })).toEqual({ agents: [] });
+      expect(
+        yield* catalog
+          .resolve(settings({ agentId: "hermes-local" }), "/workspace")
+          .pipe(Effect.flip),
+      ).toMatchObject({ reason: "agent_not_found" });
+      yield* fs.writeFileString(localAgentsPath, encodeUnknownJson({ agents: [localAgent] }));
+      expect(
+        (yield* catalog.search({ query: "Hermes" })).agents.map((agent) => agent.distribution),
+      ).toEqual(["local"]);
+      expect(
+        (yield* catalog.resolve(settings({ agentId: "hermes-local" }), "/workspace")).spawn.command,
+      ).toBe(process.execPath);
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(
+        resolverLayer((request) =>
+          Effect.succeed(
+            HttpClientResponse.fromWeb(
+              request,
+              new Response(encodeUnknownJson({ version: "1.0.0", agents: [localAgent] })),
+            ),
+          ),
+        ),
+      ),
+    );
+  });
+
+  it.effect("launches the validated executable when the agent uses a different cwd", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "t3-local-acp-cwd-" });
+      const localAgentsPath = path.join(root, "acp-agents.json");
+      const relativeExecutable = path.relative(process.cwd(), process.execPath);
+      for (const useOverride of [false, true]) {
+        yield* fs.writeFileString(
+          localAgentsPath,
+          encodeUnknownJson({
+            agents: [
+              {
+                ...localAgent,
+                command: {
+                  ...localAgent.command,
+                  path: useOverride ? process.execPath : relativeExecutable,
+                  cwd: root,
+                },
+              },
+            ],
+          }),
+        );
+        const catalog = yield* AcpRegistrySupport.makeAcpRegistryCatalog({
+          cacheDir: root,
+          toolsDir: path.join(root, "tools"),
+          localAgentsPath,
+        });
+        const resolved = yield* catalog.resolve(
+          settings({ agentId: localAgent.id, commandPath: useOverride ? relativeExecutable : "" }),
+          root,
+        );
+        expect(resolved.spawn.command).toBe(process.execPath);
+        expect(
+          yield* spawner.string(
+            ChildProcess.make(resolved.spawn.command, [...resolved.spawn.args], {
+              cwd: resolved.spawn.cwd,
+              env: resolved.spawn.env,
+            }),
+          ),
+        ).toBe(`${process.version}\n`);
+      }
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(resolverLayer(() => Effect.die("Unexpected registry request"))),
+    ),
+  );
+
+  it.effect(
+    "reports invalid local files and missing executables without installing anything",
+    () => {
+      return Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const root = yield* fs.makeTempDirectoryScoped({ prefix: "t3-local-acp-invalid-" });
+        const localAgentsPath = `${root}/acp-agents.json`;
+        const catalog = yield* AcpRegistrySupport.makeAcpRegistryCatalog({
+          cacheDir: root,
+          toolsDir: `${root}/tools`,
+          localAgentsPath,
+          registryUrl,
+        });
+        const localSettings = settings({ agentId: "hermes-local" });
+        for (const contents of [
+          "{",
+          encodeUnknownJson({ agents: [localAgent, localAgent] }),
+          encodeUnknownJson({ agents: [{ ...localAgent, command: { path: "" } }] }),
+        ]) {
+          yield* fs.writeFileString(localAgentsPath, contents);
+          expect(
+            yield* catalog.resolve(localSettings, "/workspace").pipe(Effect.flip),
+          ).toMatchObject({
+            reason: "registry_unavailable",
+            detail: "Invalid local ACP agents file.",
+          });
+        }
+        yield* fs.writeFileString(
+          localAgentsPath,
+          encodeUnknownJson({
+            agents: [
+              { ...localAgent, command: { ...localAgent.command, path: `${root}/missing` } },
+            ],
+          }),
+        );
+        expect(yield* catalog.inspect(localSettings)).toMatchObject({
+          status: "missing_runner",
+          distribution: "local",
+        });
+        expect(yield* catalog.prepare({ agentId: "hermes-local" }).pipe(Effect.flip)).toMatchObject(
+          { reason: "runner_unavailable" },
+        );
+        expect(
+          (yield* catalog.resolve(
+            settings({ agentId: "hermes-local", commandPath: process.execPath }),
+            "/workspace",
+          )).spawn.command,
+        ).toBe(process.execPath);
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(
+          resolverLayer((request) =>
+            Effect.succeed(
+              HttpClientResponse.fromWeb(request, new Response("unavailable", { status: 503 })),
+            ),
+          ),
+        ),
+      );
+    },
+  );
+});

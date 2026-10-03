@@ -14,6 +14,7 @@ export const AcpRegistryCatalogLive = Layer.merge(
       const path = yield* Path.Path;
       return AcpRegistrySupport.AcpRegistryCatalog.layer({
         cacheDir: config.providerStatusCacheDir,
+        localAgentsPath: path.join(config.baseDir, "acp-agents.json"),
         toolsDir: path.join(config.baseDir, "tools"),
       });
     }),

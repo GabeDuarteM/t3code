@@ -127,7 +127,7 @@ const AcpRegistryBinaryTarget = Schema.Struct({
   env: Schema.optionalKey(Schema.Record(BoundedMetadata, BoundedArgument)),
 });
 
-const AcpRegistryAgent = Schema.Struct({
+const AcpAgentMetadata = {
   id: BoundedAgentId,
   name: BoundedName,
   version: BoundedVersion,
@@ -137,6 +137,10 @@ const AcpRegistryAgent = Schema.Struct({
   website: Schema.optionalKey(HttpsUrl),
   repository: Schema.optionalKey(HttpsUrl),
   icon: Schema.optionalKey(HttpsUrl),
+} as const;
+
+const AcpRegistryAgent = Schema.Struct({
+  ...AcpAgentMetadata,
   distribution: Schema.Struct({
     binary: Schema.optionalKey(Schema.Record(Schema.String, AcpRegistryBinaryTarget)),
     npx: Schema.optionalKey(AcpRegistryNpxDistribution),
@@ -144,6 +148,24 @@ const AcpRegistryAgent = Schema.Struct({
   }),
 });
 export type AcpRegistryAgent = typeof AcpRegistryAgent.Type;
+
+const LocalAcpAgent = Schema.Struct({
+  ...AcpAgentMetadata,
+  command: Schema.Struct({
+    path: TrimmedNonEmptyString.check(Schema.isMaxLength(2_048)),
+    args: Schema.Array(BoundedArgument).check(Schema.isMaxLength(64)),
+    env: Schema.Record(BoundedMetadata, BoundedArgument),
+    cwd: Schema.optionalKey(TrimmedNonEmptyString.check(Schema.isMaxLength(2_048))),
+  }),
+});
+type LocalAcpAgent = typeof LocalAcpAgent.Type;
+const LocalAcpAgents = Schema.Struct({
+  agents: Schema.Array(LocalAcpAgent).check(
+    Schema.isMaxLength(512),
+    Schema.makeFilter((agents) => new Set(agents.map((agent) => agent.id)).size === agents.length),
+  ),
+});
+const decodeLocalAcpAgents = Schema.decodeUnknownEffect(Schema.fromJsonString(LocalAcpAgents));
 
 const NpmPackageManifest = Schema.Struct({
   name: Schema.String,
@@ -392,7 +414,7 @@ export const acpRegistryManagedBinaryDirectories = (input: {
   });
 
 export interface ResolvedAcpRegistryDistribution {
-  readonly kind: AcpRegistryDistributionKind;
+  readonly kind: Exclude<AcpRegistryDistributionKind, "local">;
   readonly args: ReadonlyArray<string>;
   readonly env: Readonly<Record<string, string>>;
   readonly binaryTarget?: typeof AcpRegistryBinaryTarget.Type;
@@ -439,7 +461,7 @@ export function resolveAcpRegistryDistribution(input: {
 }
 
 export interface ResolvedAcpRegistryAgent {
-  readonly agent: AcpRegistryAgent;
+  readonly agent: AcpRegistryAgent | LocalAcpAgent;
   readonly distribution: AcpRegistryDistributionKind;
   readonly spawn: AcpSpawnInput;
 }
@@ -506,6 +528,7 @@ export interface AcpRegistryCatalogOptions {
   readonly cacheDir: string;
   readonly toolsDir: string;
   readonly registryUrl?: string;
+  readonly localAgentsPath?: string;
 }
 
 const INSTALL_LOCK_RETRY_COUNT = 300;
@@ -566,7 +589,7 @@ function compareText(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
 }
 
-function searchRank(agent: AcpRegistryAgent, query: string): number | undefined {
+function searchRank(agent: AcpRegistryAgent | LocalAcpAgent, query: string): number | undefined {
   const normalized = query.trim().toLowerCase();
   if (normalized.length === 0) return 100;
 
@@ -608,6 +631,69 @@ export const makeAcpRegistryCatalog = Effect.fn("AcpRegistryCatalog.make")(funct
   const registryUrl = input.registryUrl ?? ACP_REGISTRY_URL;
   const registryDirectory = path.join(input.cacheDir, "acp-registry");
   const registryCachePath = path.join(registryDirectory, "registry.json");
+  const readLocalAgents = Effect.fn("AcpRegistryCatalog.readLocalAgents")(function* () {
+    if (input.localAgentsPath === undefined) {
+      return [];
+    }
+    const text = yield* fileSystem.readFileString(input.localAgentsPath).pipe(
+      Effect.catchTag("PlatformError", (error) =>
+        error.reason._tag === "NotFound" ? Effect.succeed('{"agents":[]}') : Effect.fail(error),
+      ),
+      Effect.mapError(
+        (cause) =>
+          new AcpRegistryError({
+            reason: "registry_unavailable",
+            detail: "Could not read local ACP agents.",
+            cause,
+          }),
+      ),
+    );
+    if (Buffer.byteLength(text) > MAX_REGISTRY_BYTES) {
+      return yield* new AcpRegistryError({
+        reason: "registry_unavailable",
+        detail: "Local ACP agents file is too large.",
+      });
+    }
+    const local = yield* decodeLocalAcpAgents(text).pipe(
+      Effect.mapError(
+        (cause) =>
+          new AcpRegistryError({
+            reason: "registry_unavailable",
+            detail: "Invalid local ACP agents file.",
+            cause,
+          }),
+      ),
+    );
+    return local.agents;
+  });
+
+  const resolveLocalAgent = Effect.fn("AcpRegistryCatalog.resolveLocalAgent")(function* (
+    agent: LocalAcpAgent,
+    commandOverride: string,
+    cwd: string,
+    environment: NodeJS.ProcessEnv,
+  ) {
+    const env = { ...environment, ...agent.command.env };
+    const commandPath = commandOverride.trim() || agent.command.path;
+    const command = resolveExecutable(commandPath, platform, env);
+    if (command === undefined) {
+      return yield* new AcpRegistryError({
+        reason: "runner_unavailable",
+        detail: `Local ACP agent ${agent.id} executable is unavailable.`,
+      });
+    }
+    return {
+      agent,
+      distribution: "local",
+      spawn: {
+        command: path.resolve(command),
+        args: agent.command.args,
+        env,
+        cwd: agent.command.cwd ?? cwd,
+      },
+    } satisfies ResolvedAcpRegistryAgent;
+  });
+
   const installsDirectory = input.toolsDir;
   const agentInstallRoot = (agent: AcpRegistryAgent) =>
     path.join(installsDirectory, agent.id, encodeURIComponent(agent.version));
@@ -1541,13 +1627,24 @@ export const makeAcpRegistryCatalog = Effect.fn("AcpRegistryCatalog.make")(funct
 
   const search: AcpRegistryCatalog["Service"]["search"] = (input) =>
     Effect.gen(function* () {
-      const registry = yield* refreshRegistry();
-      const ranked = registry.agents.flatMap((agent) => {
-        const distribution = resolveAcpRegistryDistribution({
-          agent,
-          preference: "auto",
-          platformTarget,
-        });
+      const localAgents = yield* readLocalAgents();
+      const registry = yield* refreshRegistry().pipe(
+        Effect.catch((error) =>
+          localAgents.length > 0
+            ? Effect.succeed({ version: "local", agents: [] })
+            : Effect.fail(error),
+        ),
+      );
+      const localIds = new Set(localAgents.map((agent) => agent.id));
+      const agents = [
+        ...localAgents,
+        ...registry.agents.filter((agent) => !localIds.has(agent.id)),
+      ];
+      const ranked = agents.flatMap((agent) => {
+        const distribution =
+          "command" in agent
+            ? { kind: "local" as const, binaryTarget: undefined }
+            : resolveAcpRegistryDistribution({ agent, preference: "auto", platformTarget });
         const rank = searchRank(agent, input.query);
         const packageManager =
           distribution === undefined ? undefined : packageManagerFor(distribution.kind);
@@ -1577,15 +1674,22 @@ export const makeAcpRegistryCatalog = Effect.fn("AcpRegistryCatalog.make")(funct
           icon: agent.icon ?? null,
           distribution: distribution.kind,
           integrity:
-            distribution.kind === "binary" && distribution.binaryTarget?.sha256 !== undefined
-              ? "sha256"
-              : "registry",
+            distribution.kind === "local"
+              ? "local"
+              : distribution.kind === "binary" && distribution.binaryTarget?.sha256 !== undefined
+                ? "sha256"
+                : "registry",
         })),
       } satisfies AcpRegistrySearchResult;
     });
 
   const prepare: AcpRegistryCatalog["Service"]["prepare"] = (input) =>
     Effect.gen(function* () {
+      const local = (yield* readLocalAgents()).find((agent) => agent.id === input.agentId);
+      if (local !== undefined) {
+        yield* resolveLocalAgent(local, "", local.command.cwd ?? ".", hostEnvironment);
+        return { agentId: local.id, version: local.version, distribution: "local", prepared: true };
+      }
       const registry = yield* refreshRegistry();
       const agent = yield* findAgent(registry, input.agentId);
       const distribution = yield* compatibleDistribution(agent, "auto");
@@ -1614,6 +1718,32 @@ export const makeAcpRegistryCatalog = Effect.fn("AcpRegistryCatalog.make")(funct
     Effect.gen(function* () {
       const agentId = settings.agentId.trim();
       if (agentId.length === 0) return { status: "unconfigured" } as const;
+      const local = (yield* readLocalAgents()).find((agent) => agent.id === agentId);
+      if (local !== undefined) {
+        return yield* resolveLocalAgent(
+          local,
+          settings.commandPath,
+          ".",
+          environment ?? hostEnvironment,
+        ).pipe(
+          Effect.as({
+            status: "ready" as const,
+            agentId,
+            version: null,
+            distribution: "local" as const,
+            ...(local.website ? { documentationUrl: local.website } : {}),
+          }),
+          Effect.catchTag("AcpRegistryError", () =>
+            Effect.succeed({
+              status: "missing_runner" as const,
+              agentId,
+              version: local.version,
+              distribution: "local" as const,
+              runner: settings.commandPath.trim() || local.command.path,
+            }),
+          ),
+        );
+      }
       const registry = yield* loadCachedRegistry();
       const agent = registry.agents.find((candidate) => candidate.id === agentId);
       if (agent === undefined) return { status: "not_found", agentId } as const;
@@ -1719,6 +1849,15 @@ export const makeAcpRegistryCatalog = Effect.fn("AcpRegistryCatalog.make")(funct
           reason: "agent_not_configured",
           detail: "ACP Registry provider requires a registry agent ID.",
         });
+      }
+      const local = (yield* readLocalAgents()).find((agent) => agent.id === agentId);
+      if (local !== undefined) {
+        return yield* resolveLocalAgent(
+          local,
+          settings.commandPath,
+          cwd,
+          environment ?? hostEnvironment,
+        );
       }
       const registry = yield* loadRegistry();
       const agent = yield* findAgent(registry, agentId);
